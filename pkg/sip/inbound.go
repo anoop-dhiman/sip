@@ -81,10 +81,6 @@ func hashPassword(password string) string {
 	return hex.EncodeToString(hash[:8]) // Use first 8 bytes for shorter hash
 }
 
-func generateNonce(sipCallID string) string {
-	return fmt.Sprintf("%d-%s", time.Now().UnixMicro(), sipCallID)
-}
-
 type inboundCallInfo struct {
 	sync.Mutex
 	cseq        uint32
@@ -158,6 +154,72 @@ func (s *Server) getInvite(sipCallID string) *inProgressInvite {
 	return is
 }
 
+// handleDigestAuth performs SIP digest auth (407 + Proxy-Authorization) for any
+// request. Challenge state is keyed by Call-ID so INVITE and REGISTER can share
+// the same flow. Returns true if auth succeeded or was skipped (no credentials
+// required); false if challenge was sent or auth failed.
+func (s *Server) handleDigestAuth(log logger.Logger, req *sip.Request, tx sip.ServerTransaction, username, password string) (ok bool) {
+	if username == "" || password == "" {
+		return true
+	}
+	sipCallID := ""
+	if h := req.CallID(); h != nil {
+		sipCallID = h.Value()
+	}
+	inviteState := s.getInvite(sipCallID)
+
+	h := req.GetHeader("Proxy-Authorization")
+	if h == nil {
+		inviteState.challenge = digest.Challenge{
+			Realm:     UserAgent,
+			Nonce:     fmt.Sprintf("%d", time.Now().UnixMicro()),
+			Algorithm: "MD5",
+		}
+		res := sip.NewResponseFromRequest(req, 407, "Proxy Authentication Required", nil)
+		res.AppendHeader(sip.NewHeader("Proxy-Authenticate", inviteState.challenge.String()))
+		_ = tx.Respond(res)
+		log.Infow("SIP digest auth challenge sent", "method", req.Method.String(), "sipCallID", sipCallID)
+		return false
+	}
+
+	cred, err := digest.ParseCredentials(h.Value())
+	if err != nil {
+		log.Warnw("Failed to parse Proxy-Authorization credentials", err, "headerValue", h.Value())
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 401, "Bad credentials", nil))
+		return false
+	}
+	if cred.Username != username {
+		log.Warnw("Authentication failed - username mismatch", errors.New("username mismatch"),
+			"expectedUsername", username, "receivedUsername", cred.Username)
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 401, "Unauthorized", nil))
+		return false
+	}
+	if inviteState.challenge.Realm == "" {
+		log.Warnw("No challenge state for authentication", errors.New("missing challenge state"), "sipCallID", sipCallID)
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 401, "Bad credentials", nil))
+		return false
+	}
+
+	digCred, err := digest.Digest(&inviteState.challenge, digest.Options{
+		Method:   req.Method.String(),
+		URI:      cred.URI,
+		Username: cred.Username,
+		Password: password,
+	})
+	if err != nil {
+		log.Warnw("Failed to compute digest response", err)
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 401, "Bad credentials", nil))
+		return false
+	}
+	if cred.Response != digCred.Response {
+		log.Warnw("Authentication failed - response mismatch", errors.New("response mismatch"))
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 401, "Unauthorized", nil))
+		return false
+	}
+	log.Infow("SIP digest authentication successful", "method", req.Method.String())
+	return true
+}
+
 func (s *Server) handleInviteAuth(tid traceid.ID, log logger.Logger, req *sip.Request, tx sip.ServerTransaction, from, username, password string) (ok bool) {
 	log = log.WithValues(
 		"username", username,
@@ -174,109 +236,13 @@ func (s *Server) handleInviteAuth(tid traceid.ID, log logger.Logger, req *sip.Re
 	}
 
 	if s.conf.HideInboundPort {
-		// We will send password request anyway, so might as well signal that the progress is made.
 		log.Debugw("Sending processing response due to HideInboundPort config")
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 100, "Processing", nil))
 	}
 
-	// Extract SIP Call ID for tracking in-progress invites
-	sipCallID := ""
-	if h := req.CallID(); h != nil {
-		sipCallID = h.Value()
-	}
-	inviteState := s.getInvite(sipCallID)
-	log = log.WithValues("inviteStateSipCallID", sipCallID)
-
-	h := req.GetHeader("Proxy-Authorization")
-	if h == nil {
-		inviteState.challenge = digest.Challenge{
-			Realm:     UserAgent,
-			Nonce:     generateNonce(sipCallID),
-			Algorithm: "MD5",
-		}
-
-		log.Debugw("Created digest challenge",
-			"realm", inviteState.challenge.Realm,
-			"nonce", inviteState.challenge.Nonce,
-			"algorithm", inviteState.challenge.Algorithm,
-		)
-
-		res := sip.NewResponseFromRequest(req, 407, "Unauthorized", nil)
-		res.AppendHeader(sip.NewHeader("Proxy-Authenticate", inviteState.challenge.String()))
-		_ = tx.Respond(res)
-		log.Infow("No Proxy header found. Sending 407 Unauthorized response with Proxy-Authenticate header")
+	if !s.handleDigestAuth(log, req, tx, username, password) {
 		return false
 	}
-
-	log.Debugw("Found Proxy-Authorization header, parsing credentials")
-	cred, err := digest.ParseCredentials(h.Value())
-	if err != nil {
-		log.Warnw("Failed to parse Proxy-Authorization credentials", err,
-			"headerValue", h.Value(),
-		)
-		_ = tx.Respond(sip.NewResponseFromRequest(req, 401, "Bad credentials", nil))
-		return false
-	}
-
-	// Set credURI and credUsername in logger early to avoid repetitive logging
-	log = log.WithValues("credURI", cred.URI, "credUsername", cred.Username)
-
-	log.Debugw("Parsed credentials successfully", "cred", cred)
-
-	// Validate that the username in the request matches the expected username
-	if cred.Username != username {
-		log.Warnw("Authentication failed - username mismatch", errors.New("username mismatch"),
-			"expectedUsername", username,
-			"receivedUsername", cred.Username,
-		)
-		_ = tx.Respond(sip.NewResponseFromRequest(req, 401, "Unauthorized", nil))
-		return false
-	}
-
-	// Check if we have a valid challenge state
-	if inviteState.challenge.Realm == "" {
-		log.Warnw("No challenge state found for authentication attempt", errors.New("missing challenge state"),
-			"sipCallID", sipCallID,
-			"expectedRealm", UserAgent,
-		)
-		_ = tx.Respond(sip.NewResponseFromRequest(req, 401, "Bad credentials", nil))
-		return false
-	}
-
-	log.Debugw("Computing digest response",
-		"challengeRealm", inviteState.challenge.Realm,
-		"challengeNonce", inviteState.challenge.Nonce,
-		"challengeAlgorithm", inviteState.challenge.Algorithm,
-	)
-
-	digCred, err := digest.Digest(&inviteState.challenge, digest.Options{
-		Method:   req.Method.String(),
-		URI:      cred.URI,
-		Username: cred.Username,
-		Password: password,
-	})
-
-	if err != nil {
-		log.Warnw("Failed to compute digest response", err)
-		_ = tx.Respond(sip.NewResponseFromRequest(req, 401, "Bad credentials", nil))
-		return false
-	}
-
-	log.Debugw("Digest computation completed",
-		"expectedResponse", digCred.Response,
-		"receivedResponse", cred.Response,
-		"responsesMatch", cred.Response == digCred.Response,
-	)
-
-	if cred.Response != digCred.Response {
-		log.Warnw("Authentication failed - response mismatch", errors.New("response mismatch"),
-			"expectedResponse", digCred.Response,
-			"receivedResponse", cred.Response,
-		)
-		_ = tx.Respond(sip.NewResponseFromRequest(req, 401, "Unauthorized", nil))
-		return false
-	}
-
 	log.Infow("SIP invite authentication successful")
 	return true
 }
@@ -465,6 +431,72 @@ func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retE
 
 func (s *Server) onOptions(log *slog.Logger, req *sip.Request, tx sip.ServerTransaction) {
 	_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil))
+}
+
+// onRegister handles REGISTER requests so that SIP clients (e.g. Linphone) can
+// register with the server. When the trunk has username/password configured,
+// the same digest auth as INVITE is used (407 + Proxy-Authorization). When the
+// trunk has no credentials, REGISTER is accepted without auth. No bindings are
+// stored; 200 OK echoes Contact and Expires.
+func (s *Server) onRegister(log *slog.Logger, req *sip.Request, tx sip.ServerTransaction) {
+	ctx := context.Background()
+	src, err := netip.ParseAddrPort(req.Source())
+	if err != nil {
+		s.log.Warnw("REGISTER: cannot parse source", err, "source", req.Source())
+		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad request", nil))
+		return
+	}
+	fromH, toH := req.From(), req.To()
+	if fromH == nil || toH == nil {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad request", nil))
+		return
+	}
+	callID := ""
+	if h := req.CallID(); h != nil {
+		callID = h.Value()
+	}
+	callInfo := &rpc.SIPCall{
+		LkCallId:  lksip.NewCallID(),
+		SipCallId: callID,
+		SourceIp:  src.Addr().String(),
+		Address:   ToSIPUri("", toH.Address),
+		From:      ToSIPUri("", fromH.Address),
+		To:        ToSIPUri("", toH.Address),
+	}
+	slogLog := s.log.WithValues(
+		"method", "REGISTER",
+		"from", fromH.Address.String(),
+		"to", toH.Address.String(),
+		"sourceIp", src.Addr(),
+	)
+	r, err := s.handler.GetAuthCredentials(ctx, callInfo)
+	if err != nil {
+		slogLog.Warnw("REGISTER: auth check failed", err)
+		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusServiceUnavailable, "Try again later", nil))
+		return
+	}
+	switch r.Result {
+	case AuthDrop, AuthNotFound, AuthNoTrunkFound:
+		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusNotFound, "Not found", nil))
+		return
+	case AuthQuotaExceeded:
+		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusServiceUnavailable, "Service unavailable", nil))
+		return
+	case AuthPassword:
+		if !s.handleDigestAuth(slogLog, req, tx, r.Username, r.Password) {
+			return // challenge or 401 already sent
+		}
+	case AuthAccept:
+		// no auth required
+	}
+	res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
+	for _, h := range req.GetHeaders("Contact") {
+		res.AppendHeader(sip.NewHeader("Contact", h.Value()))
+	}
+	if h := req.GetHeader("Expires"); h != nil {
+		res.AppendHeader(sip.NewHeader("Expires", h.Value()))
+	}
+	_ = tx.Respond(res)
 }
 
 func (s *Server) onAck(log *slog.Logger, req *sip.Request, tx sip.ServerTransaction) {

@@ -300,6 +300,7 @@ func (s *Server) Start(agent *sipgo.UserAgent, sc *ServiceConfig, tlsConf *tls.C
 	}
 
 	s.sipSrv.OnOptions(s.onOptions)
+	s.sipSrv.OnRegister(s.onRegister)
 	s.sipSrv.OnInvite(s.onInvite)
 	s.sipSrv.OnAck(s.onAck)
 	s.sipSrv.OnBye(s.onBye)
