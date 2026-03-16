@@ -172,7 +172,7 @@ func (s *Server) handleDigestAuth(log logger.Logger, req *sip.Request, tx sip.Se
 	if h == nil {
 		inviteState.challenge = digest.Challenge{
 			Realm:     UserAgent,
-			Nonce:     fmt.Sprintf("%d", time.Now().UnixMicro()),
+			Nonce:     fmt.Sprintf("%d-%s", time.Now().UnixMicro(), sipCallID),
 			Algorithm: "MD5",
 		}
 		res := sip.NewResponseFromRequest(req, 407, "Proxy Authentication Required", nil)
